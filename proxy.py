@@ -55,9 +55,13 @@ class VideoProxy:
         
         # Copy important headers from client request
         for header in headers:
-            if header.lower().startswith(('accept', 'user-agent', 'range')):
+            if header.lower().startswith(('accept', 'user-agent', 'range', 'referer')):
                 request += f"{header}\r\n"
         
+        # Add important headers if not present
+        if not any(h.lower().startswith('accept') for h in headers):
+            request += "Accept: */*\r\n"
+            
         request += "Connection: close\r\n\r\n"
         return request.encode('utf-8')
 
@@ -73,8 +77,12 @@ class VideoProxy:
     def parse_manifest(self, manifest_data):
         """Extract available bitrates from manifest file"""
         try:
-            manifest_data = manifest_data.strip()
-            root = ET.fromstring(manifest_data)
+            content_start = manifest_data.find(b'\r\n\r\n') + 4
+            if content_start < 4:
+                return [1000]
+                
+            manifest_content = manifest_data[content_start:].decode('utf-8').strip()
+            root = ET.fromstring(manifest_content)
             bitrates = []
             
             # Find all Representation elements and extract bandwidth
@@ -86,7 +94,8 @@ class VideoProxy:
                     continue
                     
             return sorted(bitrates) if bitrates else [1000]
-        except ET.ParseError:
+        except Exception as e:
+            logging.error(f"Error parsing manifest: {e}")
             return [1000]
         
     def select_bitrate(self, client_id):
@@ -100,27 +109,31 @@ class VideoProxy:
         
         return self.available_bitrates[0]  # Return lowest bitrate if none suitable
 
-    def update_throughput(self, client_id, chunk_size):
+    def update_throughput(self, client_id, chunk_size, chunk_name):
         """Calculate and update throughput estimate using EWMA"""
         end_time = time.time()
         start_time = self.chunk_start_times[client_id]
         duration = end_time - start_time
         
-        # Calculate throughput in Kbps
-        chunk_throughput = (chunk_size * 8) / (duration * 1000)
-        
-        # Update EWMA estimate
-        self.current_throughput[client_id] = (
-            self.alpha * chunk_throughput + 
-            (1 - self.alpha) * self.current_throughput[client_id]
-        )
-        
-        # Log chunk statistics
-        chunk_name = self.responses[client_id]['chunk_name'] if client_id in self.responses else "unknown"
-        bitrate = int(chunk_name.split('Seg')[0]) if 'Seg' in chunk_name else 0
-        
-        logging.info(f"{time.time():.3f} {duration:.3f} {chunk_throughput:.3f} "
-                    f"{self.current_throughput[client_id]:.3f} {bitrate} {chunk_name}")
+        if duration > 0:
+            # Calculate throughput in Kbps
+            chunk_throughput = (chunk_size * 8) / (duration * 1000)
+            
+            # Update EWMA estimate
+            self.current_throughput[client_id] = (
+                self.alpha * chunk_throughput + 
+                (1 - self.alpha) * self.current_throughput[client_id]
+            )
+            
+            # Extract bitrate from chunk name
+            try:
+                bitrate = int(chunk_name.split('Seg')[0])
+            except (ValueError, IndexError):
+                bitrate = 0
+            
+            # Log chunk statistics
+            logging.info(f"{time.time():.3f} {duration:.3f} {chunk_throughput:.3f} "
+                        f"{self.current_throughput[client_id]:.3f} {bitrate} {chunk_name}")
 
     def handle_request(self, client_socket, request_data):
         """Process incoming HTTP request"""
@@ -137,9 +150,8 @@ class VideoProxy:
                 path = "/index.html"
                 
             if 'manifest.mpd' in path:
-                # Replace manifest request with nolist version
+                # Fetch actual manifest first if not cached
                 if not self.manifest_cache:
-                    # Fetch and parse actual manifest first
                     manifest_path = path
                     server_request = self.create_server_request(manifest_path, headers)
                     
@@ -154,56 +166,74 @@ class VideoProxy:
                                 break
                             manifest_data += chunk
                         
-                        # Parse manifest content
-                        content_start = manifest_data.find(b'\r\n\r\n') + 4
-                        manifest_content = manifest_data[content_start:].decode('utf-8')
-                        self.available_bitrates = self.parse_manifest(manifest_content)
                         self.manifest_cache = manifest_data
+                        self.available_bitrates = self.parse_manifest(manifest_data)
+                        logging.info(f"Available bitrates: {self.available_bitrates}")
                 
-                # Send nolist manifest request
+                # Replace with nolist manifest request
                 path = path.replace('manifest.mpd', 'manifest_nolist.mpd')
                 
             elif 'Seg' in path:
                 # Handle video segment request
                 client_id = client_socket.fileno()
                 chunk_name = path.split('/')[-1]
-                current_bitrate = int(chunk_name.split('Seg')[0])
                 
-                # Record start time for throughput calculation
-                self.chunk_start_times[client_id] = time.time()
-                
-                # Select appropriate bitrate
-                new_bitrate = self.select_bitrate(client_id)
-                if current_bitrate != new_bitrate:
-                    path = path.replace(f"{current_bitrate}Seg", f"{new_bitrate}Seg")
+                try:
+                    current_bitrate = int(chunk_name.split('Seg')[0])
+                    
+                    # Record start time for throughput calculation
+                    self.chunk_start_times[client_id] = time.time()
+                    
+                    # Select appropriate bitrate
+                    new_bitrate = self.select_bitrate(client_id)
+                    if current_bitrate != new_bitrate:
+                        path = path.replace(f"{current_bitrate}Seg", f"{new_bitrate}Seg")
+                        chunk_name = path.split('/')[-1]
+                except ValueError:
+                    pass
                 
                 # Store chunk name for logging
                 if client_id not in self.responses:
                     self.responses[client_id] = {}
-                self.responses[client_id]['chunk_name'] = path.split('/')[-1]
+                self.responses[client_id]['chunk_name'] = chunk_name
             
-            # Create and send server request
-            server_request = self.create_server_request(path, headers)
+            # Create server socket and send request
             server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_sock.connect((self.server_ip, self.server_port))
-            server_sock.setblocking(False)
             
-            # Register for epoll
-            self.epoll.register(server_sock.fileno(), select.EPOLLIN)
-            self.connections[server_sock.fileno()] = server_sock
-            self.responses[server_sock.fileno()] = {
+            # Send the request
+            server_request = self.create_server_request(path, headers)
+            server_sock.send(server_request)
+            
+            # Setup for response handling
+            server_sock.setblocking(False)
+            server_fileno = server_sock.fileno()
+            
+            self.epoll.register(server_fileno, select.EPOLLIN)
+            self.connections[server_fileno] = server_sock
+            self.responses[server_fileno] = {
                 'client': client_socket,
                 'data': b'',
                 'chunk_size': 0,
-                'headers_parsed': False
+                'headers_parsed': False,
+                'chunk_name': path.split('/')[-1] if 'Seg' in path else None
             }
             
-            server_sock.send(server_request)
             return None
                 
         except Exception as e:
             logging.error(f"Error handling request: {e}")
             return None
+
+    def parse_content_length(self, headers):
+        """Extract Content-Length from response headers"""
+        for line in headers.split(b'\r\n'):
+            if line.lower().startswith(b'content-length:'):
+                try:
+                    return int(line.split(b': ')[1])
+                except (IndexError, ValueError):
+                    pass
+        return None
 
     def run(self):
         """Main event loop"""
@@ -226,50 +256,56 @@ class VideoProxy:
                             # Handle incoming data
                             if fileno in self.requests:
                                 # Client -> Proxy data
-                                data = self.connections[fileno].recv(8192)
-                                if data:
-                                    self.requests[fileno] += data
-                                    if b'\r\n\r\n' in self.requests[fileno]:
-                                        self.handle_request(
-                                            self.connections[fileno],
-                                            self.requests[fileno]
-                                        )
-                                else:
-                                    self.cleanup_connection(fileno)
-                            else:
+                                try:
+                                    data = self.connections[fileno].recv(8192)
+                                    if data:
+                                        self.requests[fileno] += data
+                                        if b'\r\n\r\n' in self.requests[fileno]:
+                                            self.handle_request(
+                                                self.connections[fileno],
+                                                self.requests[fileno]
+                                            )
+                                            self.requests[fileno] = b''
+                                    else:
+                                        self.cleanup_connection(fileno)
+                                except socket.error as e:
+                                    if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                                        self.cleanup_connection(fileno)
+                            
+                            elif fileno in self.responses:
                                 # Server -> Proxy data
-                                while True:
-                                    try:
-                                        data = self.connections[fileno].recv(8192)
-                                        if not data:
-                                            break
-                                            
+                                try:
+                                    data = self.connections[fileno].recv(8192)
+                                    if data:
                                         response = self.responses[fileno]
                                         response['data'] += data
                                         
-                                        # Parse content length from headers
+                                        # Parse headers if not done yet
                                         if not response['headers_parsed']:
                                             if b'\r\n\r\n' in response['data']:
                                                 headers = response['data'].split(b'\r\n\r\n')[0]
-                                                for line in headers.split(b'\r\n'):
-                                                    if b'Content-Length:' in line:
-                                                        response['chunk_size'] = int(line.split(b': ')[1])
+                                                response['chunk_size'] = self.parse_content_length(headers)
                                                 response['headers_parsed'] = True
                                         
                                         # Forward data to client
-                                        response['client'].send(data)
+                                        try:
+                                            response['client'].send(data)
+                                        except socket.error as e:
+                                            if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                                                self.cleanup_connection(fileno)
+                                    else:
+                                        # Connection closed by server
+                                        if response.get('chunk_name') and 'Seg' in response['chunk_name']:
+                                            self.update_throughput(
+                                                fileno,
+                                                response['chunk_size'] or len(response['data']),
+                                                response['chunk_name']
+                                            )
+                                        self.cleanup_connection(fileno)
+                                except socket.error as e:
+                                    if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                                        self.cleanup_connection(fileno)
                                         
-                                    except socket.error as e:
-                                        if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
-                                            raise
-                                        break
-                                        
-                                # Check if response is complete
-                                if len(response['data']) >= response['chunk_size'] and response['headers_parsed']:
-                                    if 'Seg' in self.responses[fileno].get('chunk_name', ''):
-                                        self.update_throughput(fileno, response['chunk_size'])
-                                    self.cleanup_connection(fileno)
-                                    
                     except Exception as e:
                         logging.error(f"Error in event loop: {e}")
                         if fileno in self.connections:
@@ -286,6 +322,10 @@ class VideoProxy:
                 self.epoll.unregister(fileno)
             
             if fileno in self.connections:
+                try:
+                    self.connections[fileno].shutdown(socket.SHUT_RDWR)
+                except socket.error:
+                    pass
                 self.connections[fileno].close()
                 del self.connections[fileno]
             
