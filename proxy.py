@@ -9,15 +9,27 @@ from collections import defaultdict
 import errno
 
 class VideoProxy:
+    """
+    This class is a proxy server that utilizes adaptive bitrate video streaming.
+    """
+    
     def __init__(self, log_file, alpha, port):
+        """
+        Initalizes the proxy with the following configurations
+
+        Args:
+            log_file (str): destination of the log file
+            alpha (float): coefficient of 0-1
+            port (int): port the proxy will listen on
+        """
         self.alpha = float(alpha)
         self.port = int(port)
         self.server_ip = "149.165.170.233"
         self.server_port = 80
         
-        # Setup logging with more detailed error information
+        # Configure logging for debugging and performance monitoring
         logging.basicConfig(
-            level=logging.DEBUG,  # Change to DEBUG temporarily
+            level=logging.DEBUG,
             format='%(asctime)s %(levelname)s: %(message)s',
             handlers=[
                 logging.FileHandler('debug.log'),
@@ -25,7 +37,7 @@ class VideoProxy:
             ]
         )
         
-        # Connection management
+        # Initialize connection
         self.epoll = select.epoll()
         self.connections = {}
         self.requests = {}
@@ -39,23 +51,42 @@ class VideoProxy:
         self.manifest_cache = None
         
     def handle_socket_error(self, e, fileno, operation):
-        """Centralized socket error handling"""
+        """
+        Centralize the error handling for socket errors
+
+        Args:
+            e (Exception): the exception to be handled
+            fileno (int): fd of the socket
+            operation (str): type of operation that failed
+
+        Returns:
+            bool: True if error was handled and connection should be closed
+        """
         if e.errno in [errno.EAGAIN, errno.EWOULDBLOCK]:
-            # Non-blocking operation would block, just continue
+            # Non-blocking operation would block
             return False
         elif e.errno in [errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED]:
-            # Connection reset or broken pipe, clean up quietly
+            # Clean up if the connection is terminated by the client
             logging.debug(f"Connection reset during {operation}: {e}")
             self.cleanup_connection(fileno)
             return True
         else:
-            # Log other errors and cleanup
+            # Unexpected error -> log error
             logging.error(f"Socket error during {operation}: {e}")
             self.cleanup_connection(fileno)
             return True
 
     def safe_send(self, sock, data):
-        """Safely send data with error handling"""
+        """
+        Safely send data with error handling
+
+        Args:
+            sock (socket): socket to send data on
+            data (bytes): data to send
+
+        Returns:
+            int: number of bytes sent, 0 o.w.
+        """
         try:
             return sock.send(data)
         except socket.error as e:
@@ -63,7 +94,16 @@ class VideoProxy:
             return 0
 
     def safe_recv(self, sock, size):
-        """Safely receive data with error handling"""
+        """
+        Safely receive data with error handling
+
+        Args:
+            sock (socket): socket to receive data on
+            size (int): max bytes to receive
+
+        Returns:
+            bytes: received data, None o.w.
+        """
         try:
             return sock.recv(size)
         except socket.error as e:
@@ -72,6 +112,9 @@ class VideoProxy:
             return b''
 
     def setup_server(self):
+        """
+        Set up the server socket and register it with epoll
+        """
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind(('', self.port))
@@ -82,7 +125,16 @@ class VideoProxy:
         self.server_socket = server_socket
 
     def create_server_request(self, path, headers):
-        """Create a proper HTTP request to the server"""
+        """
+        Create a GET request for the server
+
+        Args:
+            path (str): path
+            headers (list): request headers
+
+        Returns:
+            bytes: HTTP request
+        """
         request = f"GET {path} HTTP/1.1\r\n"
         request += f"Host: {self.server_ip}\r\n"
         
@@ -99,7 +151,15 @@ class VideoProxy:
         return request.encode('utf-8')
 
     def parse_http_request(self, request_data):
-        """Parse HTTP request into lines"""
+        """
+        Parse HTTP request to extract path and headers
+
+        Args:
+            request_data (bytes): raw HTTP request
+
+        Returns:
+            list: request lines
+        """
         try:
             request_text = request_data.decode('utf-8')
             lines = request_text.split('\r\n')
@@ -108,8 +168,17 @@ class VideoProxy:
             return []
     
     def parse_manifest(self, manifest_data):
-        """Extract available bitrates from manifest file"""
+        """
+        Parse manifest to extract available bitrates
+
+        Args:
+            manifest_data (bytes): raw manifest file
+
+        Returns:
+            list: available bitrates sorted by Kbps
+        """
         try:
+            # find the start of XML content
             content_start = manifest_data.find(b'\r\n\r\n') + 4
             if content_start < 4:
                 return [1000]
@@ -132,7 +201,15 @@ class VideoProxy:
             return [1000]
         
     def select_bitrate(self, client_id):
-        """Select highest bitrate that current throughput can support"""
+        """
+        Choose the bitrate depending on the current throughput
+
+        Args:
+            client_id (int): identifier
+
+        Returns:
+            int: selected bitrate
+        """
         current_tput = self.current_throughput[client_id]
         
         # Select highest bitrate where throughput is at least 1.5x the bitrate
@@ -143,7 +220,14 @@ class VideoProxy:
         return self.available_bitrates[0]  # Return lowest bitrate if none suitable
 
     def update_throughput(self, client_id, chunk_size, chunk_name):
-        """Calculate and update throughput estimate using EWMA with improved error handling"""
+        """
+        Update throughput estimate
+
+        Args:
+            client_id (int): identifier
+            chunk_size (int): size of chunk
+            chunk_name (str): name of chunk
+        """
         try:
             if client_id not in self.chunk_start_times:
                 logging.debug(f"No start time found for client {client_id}")
@@ -160,12 +244,12 @@ class VideoProxy:
             # Calculate throughput in Kbps
             chunk_throughput = (chunk_size * 8) / (duration * 1000)
             
-            # Sanity check on throughput value
+            # Validate throughput value
             if chunk_throughput <= 0 or chunk_throughput > 1000000:  # Max 1 Gbps
                 logging.debug(f"Invalid throughput value ({chunk_throughput}) for client {client_id}")
                 return
                 
-            # Update EWMA estimate
+            # Update estimate
             prev_throughput = self.current_throughput[client_id]
             self.current_throughput[client_id] = (
                 self.alpha * chunk_throughput + 
@@ -190,7 +274,16 @@ class VideoProxy:
                     f"start_time exists: {client_id in self.chunk_start_times}")
 
     def handle_request(self, client_socket, request_data):
-        """Process incoming HTTP request"""
+        """
+        Process HTTP requests and forward to server
+
+        Args:
+            client_socket (socket): client's socket
+            request_data (bytes): raw HTTP request data
+
+        Returns:
+            None
+        """
         try:
             request_lines = self.parse_http_request(request_data)
             if not request_lines:
@@ -211,7 +304,7 @@ class VideoProxy:
                     
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                         try:
-                            s.settimeout(5)  # Add timeout
+                            s.settimeout(5)
                             s.connect((self.server_ip, self.server_port))
                         except socket.error as e:
                             logging.error(f"Failed to connect to video server: {e}")
@@ -261,7 +354,7 @@ class VideoProxy:
             server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_sock.connect((self.server_ip, self.server_port))
             
-            # Send the request
+            # Send the request to the server
             server_request = self.create_server_request(path, headers)
             server_sock.send(server_request)
             
@@ -286,7 +379,15 @@ class VideoProxy:
             return None
 
     def parse_content_length(self, headers):
-        """Extract Content-Length from response headers"""
+        """
+        Parse content length from headers
+
+        Args:
+            headers (bytes): raw HTTP headers
+
+        Returns:
+            int: content length, None o.w.
+        """
         for line in headers.split(b'\r\n'):
             if line.lower().startswith(b'content-length:'):
                 try:
@@ -296,15 +397,19 @@ class VideoProxy:
         return None
 
     def run(self):
-        """Main event loop with improved error handling"""
+        """
+        Run the proxy server
+        """
         try:
             self.setup_server()
             
             while True:
                 try:
+                    # wait for events with a 1 sec timeout
                     events = self.epoll.poll(1)
                     for fileno, event in events:
                         if fileno == self.server_socket.fileno():
+                            # Handle new client connection
                             try:
                                 client_socket, addr = self.server_socket.accept()
                                 client_socket.setblocking(False)
@@ -324,6 +429,7 @@ class VideoProxy:
                                     continue
                                 
                                 if data:
+                                    # gather requested data
                                     self.requests[fileno] += data
                                     if b'\r\n\r\n' in self.requests[fileno]:
                                         try:
@@ -344,20 +450,25 @@ class VideoProxy:
                                     continue
                                 
                                 if data:
+                                    # Process and forward server's response
                                     response = self.responses[fileno]
                                     response['data'] += data
                                     
+                                    # Parse add'l headers
                                     if not response['headers_parsed']:
                                         if b'\r\n\r\n' in response['data']:
                                             headers = response['data'].split(b'\r\n\r\n')[0]
                                             response['chunk_size'] = self.parse_content_length(headers)
                                             response['headers_parsed'] = True
                                     
+                                    # Send data to client
                                     if not self.safe_send(response['client'], data):
                                         self.cleanup_connection(fileno)
                                 else:
+                                    # Sevrer done sending responses
                                     response = self.responses[fileno]
                                     if response.get('chunk_name') and 'Seg' in response['chunk_name']:
+                                        # update throughput
                                         try:
                                             self.update_throughput(
                                                 fileno,
@@ -388,7 +499,9 @@ class VideoProxy:
             self.cleanup()
 
     def cleanup(self):
-        """Clean up all resources"""
+        """
+        Cleanup all resources
+        """
         try:
             # Close all connections
             for fileno in list(self.connections.keys()):
@@ -404,7 +517,12 @@ class VideoProxy:
             logging.error(f"Error during cleanup: {e}")
 
     def cleanup_connection(self, fileno):
-        """Enhanced connection cleanup"""
+        """
+        Cleanup a connection
+
+        Args:
+            fileno (int): fd to be cleaned up
+        """
         try:
             # Unregister from epoll first
             try:
@@ -430,13 +548,16 @@ class VideoProxy:
             self.requests.pop(fileno, None)
             self.responses.pop(fileno, None)
             self.chunk_start_times.pop(fileno, None)
-            self.current_throughput.pop(fileno, None)  # Clean up throughput data
-            self.chunk_sizes.pop(fileno, None)  # Clean up chunk size data
+            self.current_throughput.pop(fileno, None)
+            self.chunk_sizes.pop(fileno, None)
             
         except Exception as e:
             logging.error(f"Error in cleanup_connection: {e}")
 
 def main():
+    """
+    Validates command line arguments and starts proxy.
+    """
     if len(sys.argv) != 4:
         print("Usage: python3 proxy.py <log-file> <alpha> <port>")
         sys.exit(1)
