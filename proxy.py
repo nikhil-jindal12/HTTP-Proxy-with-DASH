@@ -15,12 +15,12 @@ class VideoProxy:
         self.server_ip = "149.165.170.233"
         self.server_port = 80
         
-        # Setup logging to only include required fields
+        # Setup logging with more detailed error information
         logging.basicConfig(
-            level=logging.INFO,
-            format='%(message)s',
+            level=logging.DEBUG,  # Change to DEBUG temporarily
+            format='%(asctime)s %(levelname)s: %(message)s',
             handlers=[
-                logging.FileHandler(log_file),
+                logging.FileHandler('debug.log'),
                 logging.StreamHandler()
             ]
         )
@@ -33,10 +33,43 @@ class VideoProxy:
         
         # Video streaming state
         self.available_bitrates = []
-        self.current_throughput = defaultdict(float)
+        self.current_throughput = defaultdict(lambda: 1000)
         self.chunk_start_times = {}
         self.chunk_sizes = {}
         self.manifest_cache = None
+        
+    def handle_socket_error(self, e, fileno, operation):
+        """Centralized socket error handling"""
+        if e.errno in [errno.EAGAIN, errno.EWOULDBLOCK]:
+            # Non-blocking operation would block, just continue
+            return False
+        elif e.errno in [errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED]:
+            # Connection reset or broken pipe, clean up quietly
+            logging.debug(f"Connection reset during {operation}: {e}")
+            self.cleanup_connection(fileno)
+            return True
+        else:
+            # Log other errors and cleanup
+            logging.error(f"Socket error during {operation}: {e}")
+            self.cleanup_connection(fileno)
+            return True
+
+    def safe_send(self, sock, data):
+        """Safely send data with error handling"""
+        try:
+            return sock.send(data)
+        except socket.error as e:
+            self.handle_socket_error(e, sock.fileno(), "send")
+            return 0
+
+    def safe_recv(self, sock, size):
+        """Safely receive data with error handling"""
+        try:
+            return sock.recv(size)
+        except socket.error as e:
+            if self.handle_socket_error(e, sock.fileno(), "receive"):
+                return None
+            return b''
 
     def setup_server(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -110,19 +143,33 @@ class VideoProxy:
         return self.available_bitrates[0]  # Return lowest bitrate if none suitable
 
     def update_throughput(self, client_id, chunk_size, chunk_name):
-        """Calculate and update throughput estimate using EWMA"""
-        end_time = time.time()
-        start_time = self.chunk_start_times[client_id]
-        duration = end_time - start_time
-        
-        if duration > 0:
+        """Calculate and update throughput estimate using EWMA with improved error handling"""
+        try:
+            if client_id not in self.chunk_start_times:
+                logging.debug(f"No start time found for client {client_id}")
+                return
+                
+            end_time = time.time()
+            start_time = self.chunk_start_times[client_id]
+            duration = end_time - start_time
+            
+            if duration <= 0:
+                logging.debug(f"Invalid duration ({duration}) for client {client_id}")
+                return
+                
             # Calculate throughput in Kbps
             chunk_throughput = (chunk_size * 8) / (duration * 1000)
             
+            # Sanity check on throughput value
+            if chunk_throughput <= 0 or chunk_throughput > 1000000:  # Max 1 Gbps
+                logging.debug(f"Invalid throughput value ({chunk_throughput}) for client {client_id}")
+                return
+                
             # Update EWMA estimate
+            prev_throughput = self.current_throughput[client_id]
             self.current_throughput[client_id] = (
                 self.alpha * chunk_throughput + 
-                (1 - self.alpha) * self.current_throughput[client_id]
+                (1 - self.alpha) * prev_throughput
             )
             
             # Extract bitrate from chunk name
@@ -130,10 +177,17 @@ class VideoProxy:
                 bitrate = int(chunk_name.split('Seg')[0])
             except (ValueError, IndexError):
                 bitrate = 0
+                logging.debug(f"Could not extract bitrate from chunk name: {chunk_name}")
             
             # Log chunk statistics
             logging.info(f"{time.time():.3f} {duration:.3f} {chunk_throughput:.3f} "
                         f"{self.current_throughput[client_id]:.3f} {bitrate} {chunk_name}")
+                        
+        except Exception as e:
+            # Log the full context of the error
+            logging.error(f"Error updating throughput for client {client_id}: {e}")
+            logging.debug(f"Context - chunk_size: {chunk_size}, chunk_name: {chunk_name}, "
+                    f"start_time exists: {client_id in self.chunk_start_times}")
 
     def handle_request(self, client_socket, request_data):
         """Process incoming HTTP request"""
@@ -156,7 +210,13 @@ class VideoProxy:
                     server_request = self.create_server_request(manifest_path, headers)
                     
                     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.connect((self.server_ip, self.server_port))
+                        try:
+                            s.settimeout(5)  # Add timeout
+                            s.connect((self.server_ip, self.server_port))
+                        except socket.error as e:
+                            logging.error(f"Failed to connect to video server: {e}")
+                            return None
+                        
                         s.send(server_request)
                         
                         manifest_data = b""
@@ -236,108 +296,145 @@ class VideoProxy:
         return None
 
     def run(self):
-        """Main event loop"""
+        """Main event loop with improved error handling"""
         try:
             self.setup_server()
             
             while True:
-                events = self.epoll.poll(1)
-                for fileno, event in events:
-                    try:
+                try:
+                    events = self.epoll.poll(1)
+                    for fileno, event in events:
                         if fileno == self.server_socket.fileno():
-                            # Accept new connection
-                            client_socket, _ = self.server_socket.accept()
-                            client_socket.setblocking(False)
-                            self.epoll.register(client_socket.fileno(), select.EPOLLIN)
-                            self.connections[client_socket.fileno()] = client_socket
-                            self.requests[client_socket.fileno()] = b''
-                            
+                            try:
+                                client_socket, addr = self.server_socket.accept()
+                                client_socket.setblocking(False)
+                                self.epoll.register(client_socket.fileno(), select.EPOLLIN)
+                                self.connections[client_socket.fileno()] = client_socket
+                                self.requests[client_socket.fileno()] = b''
+                                logging.debug(f"New connection from {addr}")
+                            except socket.error as e:
+                                logging.error(f"Error accepting connection: {e}")
+                                continue
+
                         elif event & select.EPOLLIN:
-                            # Handle incoming data
                             if fileno in self.requests:
-                                # Client -> Proxy data
-                                try:
-                                    data = self.connections[fileno].recv(8192)
-                                    if data:
-                                        self.requests[fileno] += data
-                                        if b'\r\n\r\n' in self.requests[fileno]:
+                                # Handle client -> proxy data
+                                data = self.safe_recv(self.connections[fileno], 8192)
+                                if data is None:
+                                    continue
+                                
+                                if data:
+                                    self.requests[fileno] += data
+                                    if b'\r\n\r\n' in self.requests[fileno]:
+                                        try:
                                             self.handle_request(
                                                 self.connections[fileno],
                                                 self.requests[fileno]
                                             )
-                                            self.requests[fileno] = b''
-                                    else:
-                                        self.cleanup_connection(fileno)
-                                except socket.error as e:
-                                    if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
-                                        self.cleanup_connection(fileno)
-                            
+                                        except Exception as e:
+                                            logging.error(f"Error handling request: {e}")
+                                        self.requests[fileno] = b''
+                                else:
+                                    self.cleanup_connection(fileno)
+
                             elif fileno in self.responses:
-                                # Server -> Proxy data
-                                try:
-                                    data = self.connections[fileno].recv(8192)
-                                    if data:
-                                        response = self.responses[fileno]
-                                        response['data'] += data
-                                        
-                                        # Parse headers if not done yet
-                                        if not response['headers_parsed']:
-                                            if b'\r\n\r\n' in response['data']:
-                                                headers = response['data'].split(b'\r\n\r\n')[0]
-                                                response['chunk_size'] = self.parse_content_length(headers)
-                                                response['headers_parsed'] = True
-                                        
-                                        # Forward data to client
+                                # Handle server -> proxy data
+                                data = self.safe_recv(self.connections[fileno], 8192)
+                                if data is None:
+                                    continue
+                                
+                                if data:
+                                    response = self.responses[fileno]
+                                    response['data'] += data
+                                    
+                                    if not response['headers_parsed']:
+                                        if b'\r\n\r\n' in response['data']:
+                                            headers = response['data'].split(b'\r\n\r\n')[0]
+                                            response['chunk_size'] = self.parse_content_length(headers)
+                                            response['headers_parsed'] = True
+                                    
+                                    if not self.safe_send(response['client'], data):
+                                        self.cleanup_connection(fileno)
+                                else:
+                                    response = self.responses[fileno]
+                                    if response.get('chunk_name') and 'Seg' in response['chunk_name']:
                                         try:
-                                            response['client'].send(data)
-                                        except socket.error as e:
-                                            if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
-                                                self.cleanup_connection(fileno)
-                                    else:
-                                        # Connection closed by server
-                                        if response.get('chunk_name') and 'Seg' in response['chunk_name']:
                                             self.update_throughput(
                                                 fileno,
                                                 response['chunk_size'] or len(response['data']),
                                                 response['chunk_name']
                                             )
-                                        self.cleanup_connection(fileno)
-                                except socket.error as e:
-                                    if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
-                                        self.cleanup_connection(fileno)
-                                        
-                    except Exception as e:
-                        logging.error(f"Error in event loop: {e}")
-                        if fileno in self.connections:
-                            self.cleanup_connection(fileno)
-                            
-        finally:
-            self.epoll.close()
-            self.server_socket.close()
+                                        except Exception as e:
+                                            logging.error(f"Error updating throughput: {e}")
+                                    self.cleanup_connection(fileno)
 
-    def cleanup_connection(self, fileno):
-        """Clean up connection state"""
+                        elif event & (select.EPOLLERR | select.EPOLLHUP):
+                            # Handle error conditions
+                            logging.debug(f"Socket {fileno} received error/hangup event")
+                            self.cleanup_connection(fileno)
+
+                except select.error as e:
+                    if e.args[0] != errno.EINTR:
+                        logging.error(f"Error in event loop: {e}")
+                    continue
+                
+                except Exception as e:
+                    logging.error(f"Unexpected error in event loop: {e}")
+                    continue
+
+        except Exception as e:
+            logging.error(f"Fatal error in proxy: {e}")
+        finally:
+            self.cleanup()
+
+    def cleanup(self):
+        """Clean up all resources"""
         try:
-            if fileno in self.epoll.poll(0):
-                self.epoll.unregister(fileno)
+            # Close all connections
+            for fileno in list(self.connections.keys()):
+                self.cleanup_connection(fileno)
             
-            if fileno in self.connections:
-                try:
-                    self.connections[fileno].shutdown(socket.SHUT_RDWR)
-                except socket.error:
-                    pass
-                self.connections[fileno].close()
-                del self.connections[fileno]
-            
-            if fileno in self.requests:
-                del self.requests[fileno]
-            if fileno in self.responses:
-                del self.responses[fileno]
-            if fileno in self.chunk_start_times:
-                del self.chunk_start_times[fileno]
+            # Close epoll and server socket
+            if self.epoll:
+                self.epoll.close()
+            if hasattr(self, 'server_socket'):
+                self.server_socket.close()
                 
         except Exception as e:
-            logging.error(f"Error in cleanup: {e}")
+            logging.error(f"Error during cleanup: {e}")
+
+    def cleanup_connection(self, fileno):
+        """Enhanced connection cleanup"""
+        try:
+            # Unregister from epoll first
+            try:
+                if fileno in [fd for fd, _ in self.epoll.poll(0)]:
+                    self.epoll.unregister(fileno)
+            except (IOError, select.error) as e:
+                logging.debug(f"Error unregistering from epoll: {e}")
+            
+            # Close socket
+            if fileno in self.connections:
+                sock = self.connections[fileno]
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except socket.error:
+                    pass  # Socket might already be shut down
+                try:
+                    sock.close()
+                except socket.error:
+                    pass  # Socket might already be closed
+                del self.connections[fileno]
+            
+            # Clean up other resources
+            self.requests.pop(fileno, None)
+            self.responses.pop(fileno, None)
+            self.chunk_start_times.pop(fileno, None)
+            self.current_throughput.pop(fileno, None)  # Clean up throughput data
+            self.chunk_sizes.pop(fileno, None)  # Clean up chunk size data
+            
+        except Exception as e:
+            logging.error(f"Error in cleanup_connection: {e}")
 
 def main():
     if len(sys.argv) != 4:
