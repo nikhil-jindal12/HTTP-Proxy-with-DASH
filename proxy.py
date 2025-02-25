@@ -27,15 +27,15 @@ class VideoProxy:
         self.server_ip = "149.165.170.233"
         self.server_port = 80
         
-        # Configure logging for debugging and performance monitoring
-        logging.basicConfig(
-            level=logging.DEBUG,
-            format='%(asctime)s %(levelname)s: %(message)s',
-            handlers=[
-                logging.FileHandler('debug.log'),
-                logging.StreamHandler()
-            ]
-        )
+        # Performance log file
+        self.log_file = log_file
+        
+        # Create the log file immediately to ensure it exists
+        try:
+            with open(self.log_file, 'w') as f:
+                f.write("# Format: <time> <duration> <tput> <avg-tput> <bitrate> <chunkname>\n")
+        except Exception as e:
+            print(f"Error creating log file: {e}", file=sys.stderr)
         
         # Initialize connection
         self.epoll = select.epoll()
@@ -49,6 +49,25 @@ class VideoProxy:
         self.chunk_start_times = {}
         self.chunk_sizes = {}
         self.manifest_cache = None
+        
+    def log_performance(self, duration, chunk_throughput, avg_throughput, bitrate, chunk_name):
+        """
+        Logs performance data to the log file
+
+        Args:
+            duration (float): duration of the chunk
+            chunk_throughput (float): throughput of the chunk
+            avg_throughput (float): average throughput
+            bitrate (int): selected bitrate
+            chunk_name (str): name of the chunk
+        """
+        try:
+            with open(self.log_file, 'a') as f:
+                f.write(f"{time.time():.3f} {duration:.3f} {chunk_throughput:.3f} {avg_throughput:.3f} {bitrate} {chunk_name}\n")
+            print(f"Logged performance for chunk: {chunk_name}", file=sys.stderr)
+        except Exception as e:
+            # Print to stderr if logging fails
+            print(f"Error logging performance: {e}", file=sys.stderr)
         
     def handle_socket_error(self, e, fileno, operation):
         """
@@ -219,7 +238,7 @@ class VideoProxy:
         
         return self.available_bitrates[0]  # Return lowest bitrate if none suitable
 
-    def update_throughput(self, client_id, chunk_size, chunk_name):
+    def update_throughput(self, client_id, chunk_size, chunk_name, start_time):
         """
         Update throughput estimate
 
@@ -227,18 +246,18 @@ class VideoProxy:
             client_id (int): identifier
             chunk_size (int): size of chunk
             chunk_name (str): name of chunk
+            start_time (float): timestamp when chunk download started
         """
         try:
-            if client_id not in self.chunk_start_times:
-                logging.debug(f"No start time found for client {client_id}")
+            if start_time is None:
+                print(f"No start time for chunk {chunk_name}", file=sys.stderr)
                 return
                 
             end_time = time.time()
-            start_time = self.chunk_start_times[client_id]
             duration = end_time - start_time
             
             if duration <= 0:
-                logging.debug(f"Invalid duration ({duration}) for client {client_id}")
+                print(f"Invalid duration for chunk {chunk_name}: {duration}", file=sys.stderr)
                 return
                 
             # Calculate throughput in Kbps
@@ -246,7 +265,7 @@ class VideoProxy:
             
             # Validate throughput value
             if chunk_throughput <= 0 or chunk_throughput > 1000000:  # Max 1 Gbps
-                logging.debug(f"Invalid throughput value ({chunk_throughput}) for client {client_id}")
+                print(f"Invalid throughput for chunk {chunk_name}: {chunk_throughput}", file=sys.stderr)
                 return
                 
             # Update estimate
@@ -260,18 +279,23 @@ class VideoProxy:
             try:
                 bitrate = int(chunk_name.split('Seg')[0])
             except (ValueError, IndexError):
+                print(f"Invalid chunk name format: {chunk_name}", file=sys.stderr)
                 bitrate = 0
-                logging.debug(f"Could not extract bitrate from chunk name: {chunk_name}")
             
-            # Log chunk statistics
-            logging.info(f"{time.time():.3f} {duration:.3f} {chunk_throughput:.3f} "
-                        f"{self.current_throughput[client_id]:.3f} {bitrate} {chunk_name}")
+            # Log performance metrics
+            self.log_performance(
+                duration, 
+                chunk_throughput, 
+                self.current_throughput[client_id], 
+                bitrate, 
+                chunk_name
+            )
                         
         except Exception as e:
-            # Log the full context of the error
-            logging.error(f"Error updating throughput for client {client_id}: {e}")
-            logging.debug(f"Context - chunk_size: {chunk_size}, chunk_name: {chunk_name}, "
-                    f"start_time exists: {client_id in self.chunk_start_times}")
+            # Log detailed information about the error
+            print(f"Error updating throughput for chunk {chunk_name}: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
 
     def handle_request(self, client_socket, request_data):
         """
@@ -349,6 +373,7 @@ class VideoProxy:
                 if client_id not in self.responses:
                     self.responses[client_id] = {}
                 self.responses[client_id]['chunk_name'] = chunk_name
+                self.responses[client_id]['start_time'] = self.chunk_start_times.get(client_id)
             
             # Create server socket and send request
             server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -369,7 +394,9 @@ class VideoProxy:
                 'data': b'',
                 'chunk_size': 0,
                 'headers_parsed': False,
-                'chunk_name': path.split('/')[-1] if 'Seg' in path else None
+                'chunk_name': path.split('/')[-1] if 'Seg' in path else None,
+                'client_fileno': client_socket.fileno(),  # Store the client fileno
+                'start_time': self.chunk_start_times.get(client_socket.fileno())  # Store the start time
             }
             
             return None
@@ -465,15 +492,16 @@ class VideoProxy:
                                     if not self.safe_send(response['client'], data):
                                         self.cleanup_connection(fileno)
                                 else:
-                                    # Sevrer done sending responses
+                                    # Server done sending responses
                                     response = self.responses[fileno]
                                     if response.get('chunk_name') and 'Seg' in response['chunk_name']:
-                                        # update throughput
+                                        # Update throughput using the stored start time
                                         try:
                                             self.update_throughput(
-                                                fileno,
+                                                response['client_fileno'],  # Use client fileno instead
                                                 response['chunk_size'] or len(response['data']),
-                                                response['chunk_name']
+                                                response['chunk_name'],
+                                                response.get('start_time')  # Pass the stored start time
                                             )
                                         except Exception as e:
                                             logging.error(f"Error updating throughput: {e}")
